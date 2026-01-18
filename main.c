@@ -13,31 +13,6 @@
 
 #define TOOL_NAME "mdm_patcher"
 
-// Helper to check if a file exists and print size
-void debug_check_file(const char* path) {
-    struct stat st;
-    if (stat(path, &st) == 0) {
-        printf(" [DEBUG] Found: %s (%lld bytes)\n", path, (long long)st.st_size);
-    } else {
-        printf(" [DEBUG] MISSING: %s (Error: %s)\n", path, strerror(errno));
-    }
-}
-
-// Helper to list directory contents
-void debug_list_dir(const char* path) {
-    printf(" [DEBUG] Listing contents of %s:\n", path);
-    DIR *d;
-    struct dirent *dir;
-    d = opendir(path);
-    if (d) {
-        while ((dir = readdir(d)) != NULL) {
-            if (dir->d_type == DT_REG) printf("  - %s\n", dir->d_name);
-            else if (dir->d_type == DT_DIR) printf("  [D] %s\n", dir->d_name);
-        }
-        closedir(d);
-    }
-}
-
 unsigned char* read_file_to_buffer(const char* filename, size_t* size) {
     FILE* f = fopen(filename, "rb");
     if (!f) {
@@ -86,12 +61,17 @@ void remove_directory_recursive(const char *path) {
 }
 
 int main(int argc, char *argv[]) {
-    printf("--- MDM Patcher Debug Mode ---\n");
+    printf("MDM Patcher v1.0\n");
+    printf("================\n\n");
     printf("Waiting for device...\n");
 
     char* xml_info = getdeviceInformation();
     if (!xml_info || strlen(xml_info) < 10 || strcmp(xml_info, "-1") == 0) {
-        fprintf(stderr, "Error: Could not connect to device. Ensure it is plugged in and 'Trusted'.\n");
+        fprintf(stderr, "Error: Could not connect to device.\n");
+        fprintf(stderr, "Please ensure device is:\n");
+        fprintf(stderr, "  - Connected via USB\n");
+        fprintf(stderr, "  - Unlocked and trusted this computer\n");
+        fprintf(stderr, "  - Not in recovery or DFU mode\n");
         return 1;
     }
 
@@ -104,64 +84,88 @@ int main(int argc, char *argv[]) {
     if (!imei) imei = strdup("");
 
     if (!productType || !serialNumber || !buildVersion || !uniqueDeviceID) {
-        fprintf(stderr, "Error: Failed to retrieve device metadata from XML.\n");
+        fprintf(stderr, "Error: Failed to retrieve device information.\n");
         return 1;
     }
 
-    printf("Target Device: %s | %s | %s\n", productType, serialNumber, buildVersion);
+    printf("Device detected:\n");
+    printf("  Model:    %s\n", productType);
+    printf("  Serial:   %s\n", serialNumber);
+    printf("  iOS:      %s\n", buildVersion);
+    printf("  UDID:     %s\n", uniqueDeviceID);
+    printf("\n");
 
+    // Create temporary workspace
     char temp_dir_template[] = "/tmp/mdmpatch_XXXXXX";
     char* temp_path = mkdtemp(temp_dir_template);
     if (!temp_path) {
         perror("Error creating temporary directory");
         return 1;
     }
-    printf("Workspace: %s\n", temp_path);
 
+    // Load encrypted backup structure
     size_t zip_len = 0;
     unsigned char* zip_buffer = read_file_to_buffer("libiMobileeDevice.dylib", &zip_len);
     if (!zip_buffer) {
-        fprintf(stderr, "Critical Error: 'libiMobileeDevice.dylib' not found in current directory!\n");
+        fprintf(stderr, "Error: 'libiMobileeDevice.dylib' not found in current directory.\n");
         return 1;
     }
 
-    printf("Executing Patch Logic...\n");
+    printf("Preparing backup files...\n");
     
-    // 1. Extract ZIP structure
+    // Extract backup structure
     patchFile3((const char*)zip_buffer, zip_len, temp_path);
     free(zip_buffer);
     
-    // 2. Generate Plists
+    // Generate device-specific plists
     patchFile1(buildVersion, imei, productType, serialNumber, uniqueDeviceID, temp_path);
     patchFile2(buildVersion, imei, productType, serialNumber, uniqueDeviceID, temp_path);
 
-    // DEBUG: Verify files before restore
-    printf("\n--- Verifying Patch Files ---\n");
-    debug_list_dir(temp_path);
+    // Verify all required files exist
     char path_buffer[1024];
-    snprintf(path_buffer, sizeof(path_buffer), "%s/Info.plist", temp_path);
-    debug_check_file(path_buffer);
-    snprintf(path_buffer, sizeof(path_buffer), "%s/Manifest.plist", temp_path);
-    debug_check_file(path_buffer);
-    printf("-----------------------------\n\n");
-
-    printf("Starting Restore process (Handshaking with MobileBackup2)...\n");
-    
-    // Call the engine
-    int result = mainLOL(temp_path, uniqueDeviceID);
-
-    if (result == 0) {
-        printf("\n[SUCCESS] MDM Patch Applied.\n");
-        printf("Cleaning up workspace...\n");
+    snprintf(path_buffer, sizeof(path_buffer), "%s/MDMB/Info.plist", temp_path);
+    struct stat st;
+    if (stat(path_buffer, &st) != 0) {
+        fprintf(stderr, "Error: Failed to generate Info.plist\n");
         remove_directory_recursive(temp_path);
-    } else {
-        printf("\n[ERROR] Restore Failed (Code: %d).\n", result);
-        printf("[DEBUG] Workspace NOT deleted for inspection: %s\n", temp_path);
-        printf("[DEBUG] Check if 'Find My' is OFF and device is on Setup Assistant.\n");
+        return 1;
+    }
+    
+    snprintf(path_buffer, sizeof(path_buffer), "%s/MDMB/Manifest.plist", temp_path);
+    if (stat(path_buffer, &st) != 0) {
+        fprintf(stderr, "Error: Failed to generate Manifest.plist\n");
+        remove_directory_recursive(temp_path);
+        return 1;
     }
 
-    free(productType); free(serialNumber); free(buildVersion);
-    free(uniqueDeviceID); free(imei); free(xml_info);
+    printf("\nStarting restore process...\n");
+    printf("Please keep device connected and unlocked.\n\n");
+    
+    // Execute restore
+    int result = mainLOL(temp_path, uniqueDeviceID);
+
+    // Cleanup
+    if (result == 0) {
+        printf("\n✓ MDM patch applied successfully!\n");
+        printf("  Your device should now reboot.\n");
+        printf("  Complete the setup assistant to finish.\n");
+        remove_directory_recursive(temp_path);
+    } else {
+        fprintf(stderr, "\n✗ Restore failed (Error code: %d)\n", result);
+        fprintf(stderr, "\nTroubleshooting:\n");
+        fprintf(stderr, "  - Ensure 'Find My' is disabled\n");
+        fprintf(stderr, "  - Device should be on the Setup Assistant screen\n");
+        fprintf(stderr, "  - Try rebooting the device and running again\n");
+        fprintf(stderr, "\nWorkspace preserved for debugging: %s\n", temp_path);
+    }
+
+    // Free allocated memory
+    free(productType);
+    free(serialNumber);
+    free(buildVersion);
+    free(uniqueDeviceID);
+    free(imei);
+    free(xml_info);
 
     return result;
 }
