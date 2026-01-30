@@ -16,6 +16,7 @@
 #define TOOL_VERSION "1.1"
 
 int restore_debug_mode = 0;
+int show_file_digests = 0;
 
 static struct option long_options[] = {
     {"backup-source", required_argument, 0, 'b'},
@@ -23,6 +24,10 @@ static struct option long_options[] = {
     {"password",      required_argument, 0, 'p'},
     {"in-place",      no_argument,       0, 'i'},
     {"overwrite-existing-profiles", no_argument, 0, 1000},
+    {"ignore-manifest-sizes", no_argument, 0, 1001},
+    {"show-size-mismatches", no_argument, 0, 1002},
+    {"show-file-digests", no_argument, 0, 1003},
+    {"show-digest-mismatches", no_argument, 0, 1004},
     {"dry-run",       no_argument,       0, 'n'},
     {"debug",         no_argument,       0, 'd'},
     {"help",          no_argument,       0, 'h'},
@@ -39,6 +44,10 @@ static void print_usage(const char *progname) {
     printf("  -p, --password PASSWORD    BackupKeyBag password, to use when restoring from an existing backup\n");
     printf("  -i, --in-place             Modify backup in-place (saves disk space)\n");
     printf("      --overwrite-existing-profiles  Replace existing ConfigurationProfiles in backup\n");
+    printf("      --ignore-manifest-sizes  Skip Manifest.db size fix-ups\n");
+    printf("      --show-size-mismatches  Log each Manifest.db size mismatch\n");
+    printf("      --show-file-digests  Log SHA1 for each sent file\n");
+    printf("      --show-digest-mismatches  Log each Manifest.db digest mismatch\n");
     printf("  -n, --dry-run              Preview changes without restoring\n");
     printf("  -d, --debug                Enable debug output (show each file during restore)\n");
     printf("  -h, --help                 Show this help message\n");
@@ -111,6 +120,10 @@ int main(int argc, char *argv[]) {
     char *backup_password = NULL;
     int in_place = 0;
     int overwrite_existing_profiles = 0;
+    int ignore_manifest_sizes = 0;
+    int show_size_mismatches = 0;
+    int show_file_digests_flag = 0;
+    int show_digest_mismatches = 0;
     int dry_run = 0;
     int c;
 
@@ -132,6 +145,18 @@ int main(int argc, char *argv[]) {
             case 1000:
                 overwrite_existing_profiles = 1;
                 break;
+            case 1001:
+                ignore_manifest_sizes = 1;
+                break;
+            case 1002:
+                show_size_mismatches = 1;
+                break;
+            case 1003:
+                show_file_digests_flag = 1;
+                break;
+            case 1004:
+                show_digest_mismatches = 1;
+                break;
             case 'n':
                 dry_run = 1;
                 break;
@@ -152,6 +177,10 @@ int main(int argc, char *argv[]) {
 
     printf("MDM Patcher v%s\n", TOOL_VERSION);
     printf("================\n\n");
+
+    if (show_file_digests_flag) {
+        show_file_digests = 1;
+    }
 
     if (backup_source_path) {
         printf("Mode: User-provided backup\n");
@@ -315,7 +344,8 @@ int main(int argc, char *argv[]) {
         }
         
         if (patch_user_manifest_db(workspace_path, productType, serialNumber,
-                                   uniqueDeviceID, dry_run) != 0) {
+                                   uniqueDeviceID, dry_run, ignore_manifest_sizes,
+                                   show_size_mismatches, show_digest_mismatches) != 0) {
             result = 1;
             goto cleanup;
         }

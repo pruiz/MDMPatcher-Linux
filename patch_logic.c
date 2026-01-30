@@ -666,11 +666,410 @@ int patch_user_manifest_plist(const char *backup_path,
     return 0;
 }
 
+static int compute_file_sha1(const char *path, unsigned char *out_digest)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		return -1;
+	}
+
+	SHA_CTX ctx;
+	unsigned char buf[32768];
+	SHA1_Init(&ctx);
+	while (1) {
+		size_t r = fread(buf, 1, sizeof(buf), f);
+		if (r > 0) {
+			SHA1_Update(&ctx, buf, r);
+		}
+		if (r < sizeof(buf)) {
+			break;
+		}
+	}
+	SHA1_Final(out_digest, &ctx);
+	fclose(f);
+	return 0;
+}
+
+static void digest_to_hex(const unsigned char *digest, char *out_hex, size_t out_len)
+{
+	if (!digest || !out_hex || out_len < (SHA_DIGEST_LENGTH * 2 + 1)) {
+		return;
+	}
+	for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+		snprintf(out_hex + (i * 2), 3, "%02x", digest[i]);
+	}
+	out_hex[SHA_DIGEST_LENGTH * 2] = '\0';
+}
+
+static int fix_manifest_db_sizes(sqlite3 *db, const char *backup_path, int dry_run,
+                                 int show_size_mismatches) {
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_stmt *update_stmt = NULL;
+    int rc = 0;
+    int updated = 0;
+    int unchanged = 0;
+    int missing = 0;
+    int skipped = 0;
+
+    rc = sqlite3_prepare_v2(db, "SELECT fileID, domain, relativePath, file FROM Files", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[Manifest.db] Error preparing size check: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+
+    if (!dry_run) {
+        rc = sqlite3_prepare_v2(db, "UPDATE Files SET file = ? WHERE fileID = ?", -1, &update_stmt, NULL);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "[Manifest.db] Error preparing size update: %s\n", sqlite3_errmsg(db));
+            sqlite3_finalize(stmt);
+            return -1;
+        }
+        sqlite3_exec(db, "BEGIN TRANSACTION", NULL, NULL, NULL);
+    }
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *file_id = (const char *)sqlite3_column_text(stmt, 0);
+        const char *domain = (const char *)sqlite3_column_text(stmt, 1);
+        const char *relative_path = (const char *)sqlite3_column_text(stmt, 2);
+        const unsigned char *file_blob = (const unsigned char *)sqlite3_column_blob(stmt, 3);
+        int file_blob_len = sqlite3_column_bytes(stmt, 3);
+
+        if (!file_id || strlen(file_id) < 2) {
+            skipped++;
+            continue;
+        }
+
+        char file_path[1024];
+        snprintf(file_path, sizeof(file_path), "%s/%c%c/%s", backup_path, file_id[0], file_id[1], file_id);
+
+        struct stat st;
+        if (stat(file_path, &st) != 0) {
+            missing++;
+            continue;
+        }
+
+        if (!file_blob || file_blob_len <= 0) {
+            skipped++;
+            continue;
+        }
+
+        plist_t file_plist = NULL;
+        plist_from_bin((const char *)file_blob, (uint32_t)file_blob_len, &file_plist);
+        if (!file_plist) {
+            skipped++;
+            continue;
+        }
+
+        plist_t objects = plist_dict_get_item(file_plist, "$objects");
+        plist_t mbfile = NULL;
+        plist_t size_node = NULL;
+        uint64_t manifest_size = 0;
+        if (objects && plist_get_node_type(objects) == PLIST_ARRAY && plist_array_get_size(objects) > 1) {
+            mbfile = plist_array_get_item(objects, 1);
+        }
+        if (mbfile && plist_get_node_type(mbfile) == PLIST_DICT) {
+            size_node = plist_dict_get_item(mbfile, "Size");
+        }
+        if (size_node && plist_get_node_type(size_node) == PLIST_UINT) {
+            plist_get_uint_val(size_node, &manifest_size);
+        } else {
+            plist_free(file_plist);
+            skipped++;
+            continue;
+        }
+
+        if ((uint64_t)st.st_size == manifest_size) {
+            plist_free(file_plist);
+            unchanged++;
+            continue;
+        }
+
+        if (show_size_mismatches) {
+            printf("[Manifest.db] Size mismatch: %s (%s/%s) %llu -> %llu\n",
+                   file_id,
+                   domain ? domain : "(unknown)",
+                   relative_path ? relative_path : "(unknown)",
+                   (unsigned long long)manifest_size,
+                   (unsigned long long)st.st_size);
+        }
+
+        if (!dry_run) {
+            plist_dict_set_item(mbfile, "Size", plist_new_uint((uint64_t)st.st_size));
+
+            char *new_blob = NULL;
+            uint32_t new_blob_len = 0;
+            plist_to_bin(file_plist, &new_blob, &new_blob_len);
+            if (new_blob && new_blob_len > 0) {
+                sqlite3_bind_blob(update_stmt, 1, new_blob, new_blob_len, SQLITE_TRANSIENT);
+                sqlite3_bind_text(update_stmt, 2, file_id, -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(update_stmt) == SQLITE_DONE) {
+                    updated++;
+                } else {
+                    fprintf(stderr, "[Manifest.db] Failed to update size for %s\n", file_id);
+                }
+                sqlite3_reset(update_stmt);
+                sqlite3_clear_bindings(update_stmt);
+            } else {
+                fprintf(stderr, "[Manifest.db] Failed to rebuild metadata for %s\n", file_id);
+            }
+            free(new_blob);
+        }
+
+        plist_free(file_plist);
+        if (dry_run) {
+            updated++;
+        }
+    }
+
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "[Manifest.db] Error reading Files table: %s\n", sqlite3_errmsg(db));
+    }
+
+    sqlite3_finalize(stmt);
+    if (update_stmt) {
+        sqlite3_finalize(update_stmt);
+    }
+    if (!dry_run) {
+        sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+    }
+
+    printf("[Manifest.db] Size check: %d updated, %d unchanged, %d missing, %d skipped\n",
+           updated, unchanged, missing, skipped);
+
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+static int fix_manifest_db_digests(sqlite3 *db, const char *backup_path, int dry_run,
+                                   int show_digest_mismatches)
+{
+	sqlite3_stmt *stmt = NULL;
+	sqlite3_stmt *update_stmt = NULL;
+	int rc = 0;
+	int updated = 0;
+	int unchanged = 0;
+	int missing = 0;
+	int skipped = 0;
+	int uid_entries = 0;
+	int inline_entries = 0;
+
+	rc = sqlite3_prepare_v2(db, "SELECT fileID, domain, relativePath, file FROM Files", -1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "[Manifest.db] Error preparing digest check: %s\n", sqlite3_errmsg(db));
+		return -1;
+	}
+
+	if (!dry_run) {
+		rc = sqlite3_prepare_v2(db, "UPDATE Files SET file = ? WHERE fileID = ?", -1, &update_stmt, NULL);
+		if (rc != SQLITE_OK) {
+			fprintf(stderr, "[Manifest.db] Error preparing digest update: %s\n", sqlite3_errmsg(db));
+			sqlite3_finalize(stmt);
+			return -1;
+		}
+		sqlite3_exec(db, "BEGIN TRANSACTION", NULL, NULL, NULL);
+	}
+
+	while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+		const char *file_id = (const char *)sqlite3_column_text(stmt, 0);
+		const char *domain = (const char *)sqlite3_column_text(stmt, 1);
+		const char *relative_path = (const char *)sqlite3_column_text(stmt, 2);
+		const unsigned char *file_blob = (const unsigned char *)sqlite3_column_blob(stmt, 3);
+		int file_blob_len = sqlite3_column_bytes(stmt, 3);
+
+		if (!file_id || strlen(file_id) < 2) {
+			skipped++;
+			continue;
+		}
+
+		char file_path[1024];
+		snprintf(file_path, sizeof(file_path), "%s/%c%c/%s", backup_path, file_id[0], file_id[1], file_id);
+
+		struct stat st;
+		if (stat(file_path, &st) != 0) {
+			missing++;
+			continue;
+		}
+
+		if (!file_blob || file_blob_len <= 0) {
+			skipped++;
+			continue;
+		}
+
+		plist_t file_plist = NULL;
+		plist_from_bin((const char *)file_blob, (uint32_t)file_blob_len, &file_plist);
+		if (!file_plist) {
+			skipped++;
+			continue;
+		}
+
+		plist_t objects = plist_dict_get_item(file_plist, "$objects");
+		plist_t mbfile = NULL;
+		plist_t digest_node = NULL;
+		plist_t digest_data_node = NULL;
+		plist_t digest_container = NULL;
+		uint64_t digest_uid = 0;
+		int has_digest_uid = 0;
+		int digest_container_is_dict = 0;
+		if (objects && plist_get_node_type(objects) == PLIST_ARRAY && plist_array_get_size(objects) > 1) {
+			mbfile = plist_array_get_item(objects, 1);
+		}
+		if (mbfile && plist_get_node_type(mbfile) == PLIST_DICT) {
+			digest_node = plist_dict_get_item(mbfile, "Digest");
+		}
+		if (!digest_node) {
+			plist_free(file_plist);
+			skipped++;
+			continue;
+		}
+
+		plist_type digest_type = plist_get_node_type(digest_node);
+		if (digest_type == PLIST_UID) {
+			plist_get_uid_val(digest_node, &digest_uid);
+			has_digest_uid = 1;
+			uid_entries++;
+			if (!objects || plist_get_node_type(objects) != PLIST_ARRAY) {
+				plist_free(file_plist);
+				skipped++;
+				continue;
+			}
+			if (digest_uid >= plist_array_get_size(objects)) {
+				plist_free(file_plist);
+				skipped++;
+				continue;
+			}
+			digest_container = plist_array_get_item(objects, (uint32_t)digest_uid);
+			digest_data_node = digest_container;
+		} else if (digest_type == PLIST_DATA) {
+			inline_entries++;
+			digest_data_node = digest_node;
+		}
+
+		if (!digest_data_node) {
+			plist_free(file_plist);
+			skipped++;
+			continue;
+		}
+
+		if (plist_get_node_type(digest_data_node) == PLIST_DICT) {
+			plist_t nested = plist_dict_get_item(digest_data_node, "NS.data");
+			if (nested && plist_get_node_type(nested) == PLIST_DATA) {
+				digest_data_node = nested;
+				digest_container_is_dict = 1;
+			} else {
+				plist_free(file_plist);
+				skipped++;
+				continue;
+			}
+		} else if (plist_get_node_type(digest_data_node) != PLIST_DATA) {
+			plist_free(file_plist);
+			skipped++;
+			continue;
+		}
+
+		unsigned char digest[SHA_DIGEST_LENGTH];
+		if (compute_file_sha1(file_path, digest) != 0) {
+			plist_free(file_plist);
+			skipped++;
+			continue;
+		}
+
+		char *stored_data = NULL;
+		uint64_t stored_len = 0;
+		plist_get_data_val(digest_data_node, &stored_data, &stored_len);
+
+		int is_match = 0;
+		if (stored_data && stored_len == SHA_DIGEST_LENGTH) {
+			if (memcmp(stored_data, digest, SHA_DIGEST_LENGTH) == 0) {
+				is_match = 1;
+			}
+		}
+
+		if (is_match) {
+			free(stored_data);
+			plist_free(file_plist);
+			unchanged++;
+			continue;
+		}
+
+		if (show_digest_mismatches) {
+			char new_hex[SHA_DIGEST_LENGTH * 2 + 1];
+			char old_hex[SHA_DIGEST_LENGTH * 2 + 1];
+			digest_to_hex(digest, new_hex, sizeof(new_hex));
+			if (stored_data && stored_len == SHA_DIGEST_LENGTH) {
+				digest_to_hex((unsigned char *)stored_data, old_hex, sizeof(old_hex));
+			} else {
+				snprintf(old_hex, sizeof(old_hex), "%s", "(invalid)");
+			}
+			printf("[Manifest.db] Digest mismatch: %s (%s/%s) %s -> %s\n",
+			       file_id,
+			       domain ? domain : "(unknown)",
+			       relative_path ? relative_path : "(unknown)",
+			       old_hex,
+			       new_hex);
+		}
+
+		if (has_digest_uid) {
+			plist_t new_data = plist_new_data((const char *)digest, SHA_DIGEST_LENGTH);
+			if (digest_container_is_dict && digest_container) {
+				plist_dict_set_item(digest_container, "NS.data", new_data);
+			} else {
+				plist_array_set_item(objects, new_data, (uint32_t)digest_uid);
+			}
+		} else {
+			plist_dict_set_item(mbfile, "Digest", plist_new_data((const char *)digest, SHA_DIGEST_LENGTH));
+		}
+		if (!dry_run) {
+			char *new_blob = NULL;
+			uint32_t new_blob_len = 0;
+			plist_to_bin(file_plist, &new_blob, &new_blob_len);
+			if (new_blob && new_blob_len > 0) {
+				sqlite3_bind_blob(update_stmt, 1, new_blob, new_blob_len, SQLITE_TRANSIENT);
+				sqlite3_bind_text(update_stmt, 2, file_id, -1, SQLITE_TRANSIENT);
+				if (sqlite3_step(update_stmt) == SQLITE_DONE) {
+					updated++;
+				} else {
+					fprintf(stderr, "[Manifest.db] Failed to update digest for %s\n", file_id);
+				}
+				sqlite3_reset(update_stmt);
+				sqlite3_clear_bindings(update_stmt);
+			} else {
+				fprintf(stderr, "[Manifest.db] Failed to rebuild digest metadata for %s\n", file_id);
+			}
+			free(new_blob);
+		} else {
+			updated++;
+		}
+
+		free(stored_data);
+		plist_free(file_plist);
+	}
+
+	if (rc != SQLITE_DONE) {
+		fprintf(stderr, "[Manifest.db] Error reading digest data: %s\n", sqlite3_errmsg(db));
+	}
+
+	sqlite3_finalize(stmt);
+	if (update_stmt) {
+		sqlite3_finalize(update_stmt);
+	}
+	if (!dry_run) {
+		sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+	}
+
+	printf("[Manifest.db] Digest fix: %d updated, %d unchanged, %d missing, %d skipped\n",
+	       updated, unchanged, missing, skipped);
+	printf("[Manifest.db] Digest sources: %d uid, %d inline\n", uid_entries, inline_entries);
+
+	return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
 int patch_user_manifest_db(const char *backup_path,
                            const char *product_type,
                            const char *serial_number,
                            const char *udid,
-                           int dry_run) {
+                           int dry_run,
+                           int ignore_manifest_sizes,
+                           int show_size_mismatches,
+                           int show_digest_mismatches) {
     char db_path[1024];
     snprintf(db_path, sizeof(db_path), "%s/Manifest.db", backup_path);
     
@@ -718,8 +1117,22 @@ int patch_user_manifest_db(const char *backup_path,
         sqlite3_finalize(stmt);
     }
     
+    if (!ignore_manifest_sizes) {
+        if (fix_manifest_db_sizes(db, backup_path, dry_run, show_size_mismatches) != 0) {
+            sqlite3_close(db);
+            return -1;
+        }
+    } else {
+        printf("[Manifest.db] Size fix-ups skipped (--ignore-manifest-sizes)\n");
+    }
+
+    if (fix_manifest_db_digests(db, backup_path, dry_run, show_digest_mismatches) != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+
     sqlite3_close(db);
-    printf("[Manifest.db] Verified successfully (no modifications needed)\n");
+    printf("[Manifest.db] Verified successfully\n");
     return 0;
 }
 

@@ -38,6 +38,8 @@
 #include <ctype.h>
 #include <time.h>
 
+#include <openssl/sha.h>
+#include <sqlite3.h>
 #include <libimobiledevice/libimobiledevice.h>
 #include <libimobiledevice/lockdown.h>
 #include <libimobiledevice/mobilebackup2.h>
@@ -75,6 +77,15 @@ static int verbose = 1;
 static int quit_flag = 0;
 static int passcode_requested = 0;
 static char *last_processed_file = NULL;
+static char *last_batch_backup_dir = NULL;
+
+typedef struct {
+	char *path;
+	char *file_id;
+} batch_file_t;
+
+static batch_file_t *last_batch_files = NULL;
+static uint32_t last_batch_count = 0;
 
 #define PRINT_VERBOSE(min_level, ...) if (verbose >= min_level) { printf(__VA_ARGS__); };
 
@@ -788,6 +799,297 @@ static void mb2_print_plist_debug(plist_t node, const char *label)
 	free(xml);
 }
 
+static void mb2_clear_last_batch(void)
+{
+	if (last_batch_files) {
+		for (uint32_t i = 0; i < last_batch_count; i++) {
+			free(last_batch_files[i].path);
+			free(last_batch_files[i].file_id);
+		}
+		free(last_batch_files);
+	}
+	last_batch_files = NULL;
+	last_batch_count = 0;
+	free(last_batch_backup_dir);
+	last_batch_backup_dir = NULL;
+}
+
+static void mb2_set_last_batch(plist_t files, const char *backup_dir)
+{
+	mb2_clear_last_batch();
+	if (!files || plist_get_node_type(files) != PLIST_ARRAY) {
+		return;
+	}
+
+	last_batch_count = plist_array_get_size(files);
+	if (last_batch_count == 0) {
+		return;
+	}
+
+	last_batch_files = calloc(last_batch_count, sizeof(batch_file_t));
+	if (!last_batch_files) {
+		last_batch_count = 0;
+		return;
+	}
+
+	for (uint32_t i = 0; i < last_batch_count; i++) {
+		plist_t val = plist_array_get_item(files, i);
+		char *str = NULL;
+		if (val && plist_get_node_type(val) == PLIST_STRING) {
+			plist_get_string_val(val, &str);
+		}
+		if (!str) {
+			continue;
+		}
+		last_batch_files[i].path = strdup(str);
+		char *last_slash = strrchr(str, '/');
+		if (last_slash && *(last_slash + 1) != '\0') {
+			last_batch_files[i].file_id = strdup(last_slash + 1);
+		}
+		free(str);
+	}
+
+	if (backup_dir) {
+		last_batch_backup_dir = strdup(backup_dir);
+	}
+}
+
+static void mb2_print_indent(int indent)
+{
+	for (int i = 0; i < indent; i++) {
+		fputc(' ', stdout);
+	}
+}
+
+static void mb2_dump_plist_node(plist_t node, int indent)
+{
+	if (!node) {
+		printf("null");
+		return;
+	}
+
+	plist_type type = plist_get_node_type(node);
+	switch (type) {
+		case PLIST_BOOLEAN: {
+			uint8_t val = 0;
+			plist_get_bool_val(node, &val);
+			printf("%s", val ? "true" : "false");
+			break;
+		}
+		case PLIST_UINT: {
+			uint64_t val = 0;
+			plist_get_uint_val(node, &val);
+			printf("%llu", (unsigned long long)val);
+			break;
+		}
+		case PLIST_REAL: {
+			double val = 0.0;
+			plist_get_real_val(node, &val);
+			printf("%.10g", val);
+			break;
+		}
+		case PLIST_STRING: {
+			char *val = NULL;
+			plist_get_string_val(node, &val);
+			printf("\"%s\"", val ? val : "");
+			free(val);
+			break;
+		}
+		case PLIST_DATE: {
+			int32_t sec = 0;
+			int32_t usec = 0;
+			plist_get_date_val(node, &sec, &usec);
+			printf("date(%d,%d)", sec, usec);
+			break;
+		}
+		case PLIST_UID: {
+			uint64_t val = 0;
+			plist_get_uid_val(node, &val);
+			printf("uid(%llu)", (unsigned long long)val);
+			break;
+		}
+		case PLIST_DATA: {
+			char *data = NULL;
+			uint64_t len = 0;
+			plist_get_data_val(node, &data, &len);
+			printf("data[%llu] ", (unsigned long long)len);
+			if (data && len > 0) {
+				for (uint64_t i = 0; i < len; i++) {
+					printf("%02x", (unsigned char)data[i]);
+				}
+			}
+			free(data);
+			break;
+		}
+		case PLIST_ARRAY: {
+			uint32_t count = plist_array_get_size(node);
+			printf("[\n");
+			for (uint32_t i = 0; i < count; i++) {
+				plist_t item = plist_array_get_item(node, i);
+				mb2_print_indent(indent + 2);
+				printf("[%u] ", i);
+				mb2_dump_plist_node(item, indent + 2);
+				printf("\n");
+			}
+			mb2_print_indent(indent);
+			printf("]");
+			break;
+		}
+		case PLIST_DICT: {
+			printf("{\n");
+			plist_dict_iter iter = NULL;
+			plist_dict_new_iter(node, &iter);
+			char *key = NULL;
+			plist_t item = NULL;
+			while (iter) {
+				plist_dict_next_item(node, iter, &key, &item);
+				if (!key) {
+					break;
+				}
+				mb2_print_indent(indent + 2);
+				printf("%s: ", key);
+				mb2_dump_plist_node(item, indent + 2);
+				printf("\n");
+				free(key);
+				key = NULL;
+			}
+			free(iter);
+			mb2_print_indent(indent);
+			printf("}");
+			break;
+		}
+		default:
+			printf("unknown");
+			break;
+	}
+}
+
+static int mb2_compute_file_sha1(const char *path, char *out_hex, size_t out_len)
+{
+	unsigned char buf[32768];
+	SHA_CTX ctx;
+	unsigned char digest[SHA_DIGEST_LENGTH];
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		return -1;
+	}
+
+	SHA1_Init(&ctx);
+	while (1) {
+		size_t r = fread(buf, 1, sizeof(buf), f);
+		if (r > 0) {
+			SHA1_Update(&ctx, buf, r);
+		}
+		if (r < sizeof(buf)) {
+			break;
+		}
+	}
+	SHA1_Final(digest, &ctx);
+	fclose(f);
+
+	if (out_len < (SHA_DIGEST_LENGTH * 2 + 1)) {
+		return -1;
+	}
+	for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+		snprintf(out_hex + (i * 2), 3, "%02x", digest[i]);
+	}
+	out_hex[SHA_DIGEST_LENGTH * 2] = '\0';
+	return 0;
+}
+
+static void mb2_dump_manifest_db_batch(void)
+{
+	if (!last_batch_backup_dir || !last_batch_files || last_batch_count == 0) {
+		return;
+	}
+
+	char *db_path = string_build_path(last_batch_backup_dir, "MDMB", "Manifest.db", NULL);
+	if (!db_path) {
+		fprintf(stderr, "[Manifest.db] Error building database path\n");
+		return;
+	}
+
+	sqlite3 *db = NULL;
+	if (sqlite3_open(db_path, &db) != SQLITE_OK) {
+		fprintf(stderr, "[Manifest.db] Error opening %s: %s\n", db_path, sqlite3_errmsg(db));
+		sqlite3_close(db);
+		free(db_path);
+		return;
+	}
+	free(db_path);
+
+	sqlite3_stmt *stmt = NULL;
+	if (sqlite3_prepare_v2(db, "SELECT domain, relativePath, file FROM Files WHERE fileID = ?", -1, &stmt, NULL) != SQLITE_OK) {
+		fprintf(stderr, "[Manifest.db] Error preparing query: %s\n", sqlite3_errmsg(db));
+		sqlite3_close(db);
+		return;
+	}
+
+	printf("[Manifest.db] Dumping batch metadata for digest mismatch\n");
+	for (uint32_t i = 0; i < last_batch_count; i++) {
+		const char *file_id = last_batch_files[i].file_id;
+		const char *file_path = last_batch_files[i].path;
+		if (!file_id || !file_path) {
+			continue;
+		}
+		char *local_path = string_build_path(last_batch_backup_dir, file_path, NULL);
+		printf("[Manifest.db] File %s\n", file_id);
+		printf("  path: %s\n", file_path);
+		if (local_path) {
+			struct stat st;
+			if (stat(local_path, &st) == 0) {
+				char sha_hex[SHA_DIGEST_LENGTH * 2 + 1] = {0};
+				if (mb2_compute_file_sha1(local_path, sha_hex, sizeof(sha_hex)) == 0) {
+					printf("  size_on_disk: %llu\n", (unsigned long long)st.st_size);
+					printf("  sha1: %s\n", sha_hex);
+				} else {
+					printf("  size_on_disk: %llu\n", (unsigned long long)st.st_size);
+					printf("  sha1: (error)\n");
+				}
+			} else {
+				printf("  size_on_disk: (missing)\n");
+			}
+			free(local_path);
+		}
+
+		sqlite3_bind_text(stmt, 1, file_id, -1, SQLITE_TRANSIENT);
+		int rc = sqlite3_step(stmt);
+		if (rc == SQLITE_ROW) {
+			const unsigned char *domain = sqlite3_column_text(stmt, 0);
+			const unsigned char *relpath = sqlite3_column_text(stmt, 1);
+			const unsigned char *file_blob = sqlite3_column_blob(stmt, 2);
+			int file_blob_len = sqlite3_column_bytes(stmt, 2);
+
+			printf("  domain: %s\n", domain ? (const char *)domain : "(null)");
+			printf("  relativePath: %s\n", relpath ? (const char *)relpath : "(null)");
+
+			if (file_blob && file_blob_len > 0) {
+				plist_t archive = NULL;
+				plist_from_bin((const char *)file_blob, (uint32_t)file_blob_len, &archive);
+				if (archive) {
+					printf("  NSKeyedArchiver:\n");
+					mb2_print_indent(4);
+					mb2_dump_plist_node(archive, 4);
+					printf("\n");
+					plist_free(archive);
+				} else {
+					printf("  NSKeyedArchiver: (invalid plist)\n");
+				}
+			} else {
+				printf("  NSKeyedArchiver: (empty)\n");
+			}
+		} else {
+			printf("  Manifest.db: (no entry)\n");
+		}
+		sqlite3_reset(stmt);
+		sqlite3_clear_bindings(stmt);
+	}
+
+	sqlite3_finalize(stmt);
+	sqlite3_close(db);
+	mb2_clear_last_batch();
+}
+
 static int errno_to_device_error(int errno_value)
 {
 	switch (errno_value) {
@@ -842,6 +1144,9 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	off_t total;
 	off_t sent;
 #endif
+	int sha_enabled = show_file_digests ? 1 : 0;
+	SHA_CTX sha_ctx;
+	unsigned char sha_digest[SHA_DIGEST_LENGTH];
 
 	mobilebackup2_error_t err;
 
@@ -894,6 +1199,9 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	}
 
 	sent = 0;
+	if (sha_enabled) {
+		SHA1_Init(&sha_ctx);
+	}
 	do {
 		length = ((total-sent) < (long long)sizeof(buf)) ? (uint32_t)total-sent : (uint32_t)sizeof(buf);
 		/* send data size (file size + 1) */
@@ -915,6 +1223,9 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 			errcode = errno;
 			goto leave;
 		}
+		if (sha_enabled) {
+			SHA1_Update(&sha_ctx, buf, r);
+		}
 		err = mobilebackup2_send_raw(mobilebackup2, buf, r, &bytes);
 		if (err != MOBILEBACKUP2_E_SUCCESS) {
 			goto leave_proto_err;
@@ -928,6 +1239,15 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	fclose(f);
 	f = NULL;
 	errcode = 0;
+	if (sha_enabled) {
+		SHA1_Final(sha_digest, &sha_ctx);
+		char sha_hex[SHA_DIGEST_LENGTH * 2 + 1];
+		for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+			snprintf(sha_hex + (i * 2), 3, "%02x", sha_digest[i]);
+		}
+		sha_hex[SHA_DIGEST_LENGTH * 2] = '\0';
+		PRINT_VERBOSE(1, "  [Digest] %s %s\n", path, sha_hex);
+	}
 
 leave:
 	if (errcode == 0) {
@@ -980,6 +1300,7 @@ static void mb2_handle_send_files(mobilebackup2_client_t mobilebackup2, plist_t 
 	if (!message || (plist_get_node_type(message) != PLIST_ARRAY) || (plist_array_get_size(message) < 2) || !backup_dir) return;
 
 	plist_t files = plist_array_get_item(message, 1);
+	mb2_set_last_batch(files, backup_dir);
 	cnt = plist_array_get_size(files);
 
 	for (i = 0; i < cnt; i++) {
@@ -2204,16 +2525,19 @@ checkpoint:
 					if (nn && (plist_get_node_type(nn) == PLIST_STRING)) {
 						plist_get_string_val(nn, &str);
 					}
-				if (error_code != 0) {
-					if (str) {
-						printf("ErrorCode %d: %s\n", error_code, str);
-					} else {
-						printf("ErrorCode %d: (Unknown)\n", error_code);
-					}
-					if (restore_debug_mode) {
-						mb2_print_plist_debug(node_tmp, "Device error details:");
-					}
+			if (error_code != 0) {
+				if (str) {
+					printf("ErrorCode %d: %s\n", error_code, str);
+				} else {
+					printf("ErrorCode %d: (Unknown)\n", error_code);
 				}
+				if (error_code == 205) {
+					mb2_dump_manifest_db_batch();
+				}
+				if (restore_debug_mode) {
+					mb2_print_plist_debug(node_tmp, "Device error details:");
+				}
+			}
 					if (str) {
 						free(str);
 					}

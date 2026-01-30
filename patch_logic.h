@@ -113,6 +113,9 @@ int patch_user_manifest_plist(const char *backup_path,
  * @param serial_number Device serial number
  * @param udid Device UDID
  * @param dry_run If non-zero, only preview changes
+ * @param ignore_manifest_sizes If non-zero, skip Manifest.db size fix-ups
+ * @param show_size_mismatches If non-zero, log each size mismatch
+ * @param show_digest_mismatches If non-zero, log each digest mismatch
  * @return 0 on success, -1 on failure (or 0 if no Manifest.db exists)
  * 
  * Note: The Files table with SHA-1 hashes is NOT modified.
@@ -121,7 +124,10 @@ int patch_user_manifest_db(const char *backup_path,
                            const char *product_type,
                            const char *serial_number,
                            const char *udid,
-                           int dry_run);
+                           int dry_run,
+                           int ignore_manifest_sizes,
+                           int show_size_mismatches,
+                           int show_digest_mismatches);
 
 /**
  * @brief Ensures Status.plist shows a successful backup state.

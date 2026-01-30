@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 extern int restore_debug_mode;
+extern int show_file_digests;
 int mainLOL(char *path, char *uuidi, char *backup_password);
 
 #endif /* idevicebackup2_h */
