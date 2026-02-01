@@ -38,6 +38,8 @@
 #include <ctype.h>
 #include <time.h>
 
+#include <openssl/sha.h>
+#include <sqlite3.h>
 #include <libimobiledevice/libimobiledevice.h>
 #include <libimobiledevice/lockdown.h>
 #include <libimobiledevice/mobilebackup2.h>
@@ -57,6 +59,9 @@
 #include <windows.h>
 #include <conio.h>
 #define sleep(x) Sleep(x*1000)
+#ifndef ELOOP
+#define ELOOP 114
+#endif
 #else
 #include <termios.h>
 #include <sys/statvfs.h>
@@ -70,8 +75,228 @@
 
 static int verbose = 1;
 static int quit_flag = 0;
+static int passcode_requested = 0;
+static char *last_processed_file = NULL;
+static char *last_batch_backup_dir = NULL;
+
+typedef struct {
+	char *path;
+	char *file_id;
+} batch_file_t;
+
+static batch_file_t *last_batch_files = NULL;
+static uint32_t last_batch_count = 0;
+static sqlite3 *missing_manifest_db = NULL;
+static sqlite3_stmt *missing_manifest_stmt = NULL;
+static char *missing_manifest_root = NULL;
+static int missing_total = 0;
+static int missing_skipped = 0;
+static int missing_failed = 0;
 
 #define PRINT_VERBOSE(min_level, ...) if (verbose >= min_level) { printf(__VA_ARGS__); };
+
+static void mb2_missing_manifest_close(void)
+{
+	if (missing_manifest_stmt) {
+		sqlite3_finalize(missing_manifest_stmt);
+		missing_manifest_stmt = NULL;
+	}
+	if (missing_manifest_db) {
+		sqlite3_close(missing_manifest_db);
+		missing_manifest_db = NULL;
+	}
+	if (missing_manifest_root) {
+		free(missing_manifest_root);
+		missing_manifest_root = NULL;
+	}
+}
+
+static void mb2_missing_reset(void)
+{
+	missing_total = 0;
+	missing_skipped = 0;
+	missing_failed = 0;
+	mb2_missing_manifest_close();
+}
+
+static void mb2_print_missing_summary(void)
+{
+	if (missing_total == 0) {
+		return;
+	}
+	PRINT_VERBOSE(1, "[Restore] Missing files: total %d, skipped %d (zero-size placeholders), failed %d\n",
+		missing_total, missing_skipped, missing_failed);
+}
+
+static int mb2_missing_manifest_open(const char *backup_dir)
+{
+	if (!backup_dir) {
+		return -1;
+	}
+	if (missing_manifest_db && missing_manifest_root && strcmp(missing_manifest_root, backup_dir) == 0) {
+		return 0;
+	}
+
+	mb2_missing_manifest_close();
+
+	char *db_path = string_build_path(backup_dir, "MDMB", "Manifest.db", NULL);
+	if (!db_path) {
+		return -1;
+	}
+
+	struct stat st;
+	if (stat(db_path, &st) != 0) {
+		free(db_path);
+		return -1;
+	}
+
+	if (sqlite3_open(db_path, &missing_manifest_db) != SQLITE_OK) {
+		sqlite3_close(missing_manifest_db);
+		missing_manifest_db = NULL;
+		free(db_path);
+		return -1;
+	}
+	free(db_path);
+
+	if (sqlite3_prepare_v2(missing_manifest_db, "SELECT file FROM Files WHERE fileID = ?", -1, &missing_manifest_stmt, NULL) != SQLITE_OK) {
+		sqlite3_finalize(missing_manifest_stmt);
+		missing_manifest_stmt = NULL;
+		sqlite3_close(missing_manifest_db);
+		missing_manifest_db = NULL;
+		return -1;
+	}
+
+	missing_manifest_root = strdup(backup_dir);
+	if (!missing_manifest_root) {
+		mb2_missing_manifest_close();
+		return -1;
+	}
+
+	return 0;
+}
+
+static int mb2_manifest_blob_is_empty_placeholder(const unsigned char *file_blob, int file_blob_len)
+{
+	static const unsigned char empty_digest[SHA_DIGEST_LENGTH] = {
+		0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55,
+		0xbf, 0xef, 0x95, 0x60, 0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09
+	};
+	plist_t file_plist = NULL;
+	plist_t objects = NULL;
+	plist_t mbfile = NULL;
+	plist_t size_node = NULL;
+	plist_t digest_node = NULL;
+	plist_t digest_data_node = NULL;
+	uint64_t manifest_size = 0;
+	uint64_t digest_uid = 0;
+
+	if (!file_blob || file_blob_len <= 0) {
+		return 0;
+	}
+
+	plist_from_bin((const char *)file_blob, (uint32_t)file_blob_len, &file_plist);
+	if (!file_plist) {
+		return 0;
+	}
+
+	objects = plist_dict_get_item(file_plist, "$objects");
+	if (objects && plist_get_node_type(objects) == PLIST_ARRAY && plist_array_get_size(objects) > 1) {
+		mbfile = plist_array_get_item(objects, 1);
+	}
+	if (!mbfile || plist_get_node_type(mbfile) != PLIST_DICT) {
+		plist_free(file_plist);
+		return 0;
+	}
+
+	size_node = plist_dict_get_item(mbfile, "Size");
+	if (size_node && plist_get_node_type(size_node) == PLIST_UINT) {
+		plist_get_uint_val(size_node, &manifest_size);
+	}
+	if (manifest_size != 0) {
+		plist_free(file_plist);
+		return 0;
+	}
+
+	digest_node = plist_dict_get_item(mbfile, "Digest");
+	if (!digest_node) {
+		plist_free(file_plist);
+		return 0;
+	}
+
+	plist_type digest_type = plist_get_node_type(digest_node);
+	if (digest_type == PLIST_UID) {
+		if (!objects || plist_get_node_type(objects) != PLIST_ARRAY) {
+			plist_free(file_plist);
+			return 0;
+		}
+		plist_get_uid_val(digest_node, &digest_uid);
+		if (digest_uid >= plist_array_get_size(objects)) {
+			plist_free(file_plist);
+			return 0;
+		}
+		digest_data_node = plist_array_get_item(objects, (uint32_t)digest_uid);
+	} else if (digest_type == PLIST_DATA) {
+		digest_data_node = digest_node;
+	}
+
+	if (!digest_data_node) {
+		plist_free(file_plist);
+		return 0;
+	}
+
+	if (plist_get_node_type(digest_data_node) == PLIST_DICT) {
+		plist_t nested = plist_dict_get_item(digest_data_node, "NS.data");
+		if (nested && plist_get_node_type(nested) == PLIST_DATA) {
+			digest_data_node = nested;
+		} else {
+			plist_free(file_plist);
+			return 0;
+		}
+	} else if (plist_get_node_type(digest_data_node) != PLIST_DATA) {
+		plist_free(file_plist);
+		return 0;
+	}
+
+	char *stored_data = NULL;
+	uint64_t stored_len = 0;
+	plist_get_data_val(digest_data_node, &stored_data, &stored_len);
+
+	int is_empty = 0;
+	if (stored_data && stored_len == SHA_DIGEST_LENGTH) {
+		if (memcmp(stored_data, empty_digest, SHA_DIGEST_LENGTH) == 0) {
+			is_empty = 1;
+		}
+	}
+
+	free(stored_data);
+	plist_free(file_plist);
+	return is_empty;
+}
+
+static int mb2_manifest_is_empty_placeholder(const char *backup_dir, const char *file_id)
+{
+	if (!backup_dir || !file_id) {
+		return 0;
+	}
+	if (mb2_missing_manifest_open(backup_dir) != 0 || !missing_manifest_stmt) {
+		return 0;
+	}
+
+	int is_empty = 0;
+	sqlite3_bind_text(missing_manifest_stmt, 1, file_id, -1, SQLITE_TRANSIENT);
+	int rc = sqlite3_step(missing_manifest_stmt);
+	if (rc == SQLITE_ROW) {
+		const unsigned char *file_blob = sqlite3_column_blob(missing_manifest_stmt, 0);
+		int file_blob_len = sqlite3_column_bytes(missing_manifest_stmt, 0);
+		if (file_blob && file_blob_len > 0) {
+			is_empty = mb2_manifest_blob_is_empty_placeholder(file_blob, file_blob_len);
+		}
+	}
+	sqlite3_reset(missing_manifest_stmt);
+	sqlite3_clear_bindings(missing_manifest_stmt);
+
+	return is_empty;
+}
 
 enum cmd_mode {
 	CMD_BACKUP,
@@ -111,6 +336,10 @@ static void notify_cb(const char *notification, void *userdata)
 		quit_flag++;
 	} else if (!strcmp(notification, NP_BACKUP_DOMAIN_CHANGED)) {
 		backup_domain_changed = 1;
+		} else if (!strcmp(notification, "com.apple.LocalAuthentication.ui.presented")) {
+		passcode_requested = 1;
+	} else if (!strcmp(notification, "com.apple.LocalAuthentication.ui.dismissed")) {
+		passcode_requested = 0;
 	} else {
 		PRINT_VERBOSE(1, "Unhandled notification '%s' (TODO: implement)\n", notification);
 	}
@@ -733,6 +962,343 @@ static void mb2_multi_status_add_file_error(plist_t status_dict, const char *pat
 	plist_dict_set_item(status_dict, path, filedict);
 }
 
+static void mb2_print_file_error(plist_t status_dict, const char *path)
+{
+	if (!status_dict || !path) return;
+
+	plist_t filedict = plist_dict_get_item(status_dict, path);
+	if (!filedict || plist_get_node_type(filedict) != PLIST_DICT) {
+		return;
+	}
+
+	plist_t code_node = plist_dict_get_item(filedict, "DLFileErrorCode");
+	plist_t msg_node = plist_dict_get_item(filedict, "DLFileErrorString");
+	uint64_t code = 0;
+	char *message = NULL;
+
+	if (code_node && plist_get_node_type(code_node) == PLIST_UINT) {
+		plist_get_uint_val(code_node, &code);
+	}
+	if (msg_node && plist_get_node_type(msg_node) == PLIST_STRING) {
+		plist_get_string_val(msg_node, &message);
+	}
+
+	if (message) {
+		fprintf(stderr, "ERROR: Failed to send file '%s': %s (%llu)\n", path, message, (unsigned long long)code);
+		free(message);
+	} else if (code_node) {
+		fprintf(stderr, "ERROR: Failed to send file '%s' (error code %llu)\n", path, (unsigned long long)code);
+	} else {
+		fprintf(stderr, "ERROR: Failed to send file '%s'\n", path);
+	}
+}
+
+static void mb2_print_plist_debug(plist_t node, const char *label)
+{
+	if (!node || !label) return;
+
+	char *xml = NULL;
+	uint32_t xml_len = 0;
+	plist_to_xml(node, &xml, &xml_len);
+	if (!xml) {
+		return;
+	}
+
+	fprintf(stderr, "%s\n%s\n", label, xml);
+	free(xml);
+}
+
+static void mb2_clear_last_batch(void)
+{
+	if (last_batch_files) {
+		for (uint32_t i = 0; i < last_batch_count; i++) {
+			free(last_batch_files[i].path);
+			free(last_batch_files[i].file_id);
+		}
+		free(last_batch_files);
+	}
+	last_batch_files = NULL;
+	last_batch_count = 0;
+	free(last_batch_backup_dir);
+	last_batch_backup_dir = NULL;
+}
+
+static void mb2_set_last_batch(plist_t files, const char *backup_dir)
+{
+	mb2_clear_last_batch();
+	if (!files || plist_get_node_type(files) != PLIST_ARRAY) {
+		return;
+	}
+
+	last_batch_count = plist_array_get_size(files);
+	if (last_batch_count == 0) {
+		return;
+	}
+
+	last_batch_files = calloc(last_batch_count, sizeof(batch_file_t));
+	if (!last_batch_files) {
+		last_batch_count = 0;
+		return;
+	}
+
+	for (uint32_t i = 0; i < last_batch_count; i++) {
+		plist_t val = plist_array_get_item(files, i);
+		char *str = NULL;
+		if (val && plist_get_node_type(val) == PLIST_STRING) {
+			plist_get_string_val(val, &str);
+		}
+		if (!str) {
+			continue;
+		}
+		last_batch_files[i].path = strdup(str);
+		char *last_slash = strrchr(str, '/');
+		if (last_slash && *(last_slash + 1) != '\0') {
+			last_batch_files[i].file_id = strdup(last_slash + 1);
+		}
+		free(str);
+	}
+
+	if (backup_dir) {
+		last_batch_backup_dir = strdup(backup_dir);
+	}
+}
+
+static void mb2_print_indent(int indent)
+{
+	for (int i = 0; i < indent; i++) {
+		fputc(' ', stdout);
+	}
+}
+
+static void mb2_dump_plist_node(plist_t node, int indent)
+{
+	if (!node) {
+		printf("null");
+		return;
+	}
+
+	plist_type type = plist_get_node_type(node);
+	switch (type) {
+		case PLIST_BOOLEAN: {
+			uint8_t val = 0;
+			plist_get_bool_val(node, &val);
+			printf("%s", val ? "true" : "false");
+			break;
+		}
+		case PLIST_UINT: {
+			uint64_t val = 0;
+			plist_get_uint_val(node, &val);
+			printf("%llu", (unsigned long long)val);
+			break;
+		}
+		case PLIST_REAL: {
+			double val = 0.0;
+			plist_get_real_val(node, &val);
+			printf("%.10g", val);
+			break;
+		}
+		case PLIST_STRING: {
+			char *val = NULL;
+			plist_get_string_val(node, &val);
+			printf("\"%s\"", val ? val : "");
+			free(val);
+			break;
+		}
+		case PLIST_DATE: {
+			int32_t sec = 0;
+			int32_t usec = 0;
+			plist_get_date_val(node, &sec, &usec);
+			printf("date(%d,%d)", sec, usec);
+			break;
+		}
+		case PLIST_UID: {
+			uint64_t val = 0;
+			plist_get_uid_val(node, &val);
+			printf("uid(%llu)", (unsigned long long)val);
+			break;
+		}
+		case PLIST_DATA: {
+			char *data = NULL;
+			uint64_t len = 0;
+			plist_get_data_val(node, &data, &len);
+			printf("data[%llu] ", (unsigned long long)len);
+			if (data && len > 0) {
+				for (uint64_t i = 0; i < len; i++) {
+					printf("%02x", (unsigned char)data[i]);
+				}
+			}
+			free(data);
+			break;
+		}
+		case PLIST_ARRAY: {
+			uint32_t count = plist_array_get_size(node);
+			printf("[\n");
+			for (uint32_t i = 0; i < count; i++) {
+				plist_t item = plist_array_get_item(node, i);
+				mb2_print_indent(indent + 2);
+				printf("[%u] ", i);
+				mb2_dump_plist_node(item, indent + 2);
+				printf("\n");
+			}
+			mb2_print_indent(indent);
+			printf("]");
+			break;
+		}
+		case PLIST_DICT: {
+			printf("{\n");
+			plist_dict_iter iter = NULL;
+			plist_dict_new_iter(node, &iter);
+			char *key = NULL;
+			plist_t item = NULL;
+			while (iter) {
+				plist_dict_next_item(node, iter, &key, &item);
+				if (!key) {
+					break;
+				}
+				mb2_print_indent(indent + 2);
+				printf("%s: ", key);
+				mb2_dump_plist_node(item, indent + 2);
+				printf("\n");
+				free(key);
+				key = NULL;
+			}
+			free(iter);
+			mb2_print_indent(indent);
+			printf("}");
+			break;
+		}
+		default:
+			printf("unknown");
+			break;
+	}
+}
+
+static int mb2_compute_file_sha1(const char *path, char *out_hex, size_t out_len)
+{
+	unsigned char buf[32768];
+	SHA_CTX ctx;
+	unsigned char digest[SHA_DIGEST_LENGTH];
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		return -1;
+	}
+
+	SHA1_Init(&ctx);
+	while (1) {
+		size_t r = fread(buf, 1, sizeof(buf), f);
+		if (r > 0) {
+			SHA1_Update(&ctx, buf, r);
+		}
+		if (r < sizeof(buf)) {
+			break;
+		}
+	}
+	SHA1_Final(digest, &ctx);
+	fclose(f);
+
+	if (out_len < (SHA_DIGEST_LENGTH * 2 + 1)) {
+		return -1;
+	}
+	for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+		snprintf(out_hex + (i * 2), 3, "%02x", digest[i]);
+	}
+	out_hex[SHA_DIGEST_LENGTH * 2] = '\0';
+	return 0;
+}
+
+static void mb2_dump_manifest_db_batch(void)
+{
+	if (!last_batch_backup_dir || !last_batch_files || last_batch_count == 0) {
+		return;
+	}
+
+	char *db_path = string_build_path(last_batch_backup_dir, "MDMB", "Manifest.db", NULL);
+	if (!db_path) {
+		fprintf(stderr, "[Manifest.db] Error building database path\n");
+		return;
+	}
+
+	sqlite3 *db = NULL;
+	if (sqlite3_open(db_path, &db) != SQLITE_OK) {
+		fprintf(stderr, "[Manifest.db] Error opening %s: %s\n", db_path, sqlite3_errmsg(db));
+		sqlite3_close(db);
+		free(db_path);
+		return;
+	}
+	free(db_path);
+
+	sqlite3_stmt *stmt = NULL;
+	if (sqlite3_prepare_v2(db, "SELECT domain, relativePath, file FROM Files WHERE fileID = ?", -1, &stmt, NULL) != SQLITE_OK) {
+		fprintf(stderr, "[Manifest.db] Error preparing query: %s\n", sqlite3_errmsg(db));
+		sqlite3_close(db);
+		return;
+	}
+
+	printf("[Manifest.db] Dumping batch metadata for digest mismatch\n");
+	for (uint32_t i = 0; i < last_batch_count; i++) {
+		const char *file_id = last_batch_files[i].file_id;
+		const char *file_path = last_batch_files[i].path;
+		if (!file_id || !file_path) {
+			continue;
+		}
+		char *local_path = string_build_path(last_batch_backup_dir, file_path, NULL);
+		printf("[Manifest.db] File %s\n", file_id);
+		printf("  path: %s\n", file_path);
+		if (local_path) {
+			struct stat st;
+			if (stat(local_path, &st) == 0) {
+				char sha_hex[SHA_DIGEST_LENGTH * 2 + 1] = {0};
+				if (mb2_compute_file_sha1(local_path, sha_hex, sizeof(sha_hex)) == 0) {
+					printf("  size_on_disk: %llu\n", (unsigned long long)st.st_size);
+					printf("  sha1: %s\n", sha_hex);
+				} else {
+					printf("  size_on_disk: %llu\n", (unsigned long long)st.st_size);
+					printf("  sha1: (error)\n");
+				}
+			} else {
+				printf("  size_on_disk: (missing)\n");
+			}
+			free(local_path);
+		}
+
+		sqlite3_bind_text(stmt, 1, file_id, -1, SQLITE_TRANSIENT);
+		int rc = sqlite3_step(stmt);
+		if (rc == SQLITE_ROW) {
+			const unsigned char *domain = sqlite3_column_text(stmt, 0);
+			const unsigned char *relpath = sqlite3_column_text(stmt, 1);
+			const unsigned char *file_blob = sqlite3_column_blob(stmt, 2);
+			int file_blob_len = sqlite3_column_bytes(stmt, 2);
+
+			printf("  domain: %s\n", domain ? (const char *)domain : "(null)");
+			printf("  relativePath: %s\n", relpath ? (const char *)relpath : "(null)");
+
+			if (file_blob && file_blob_len > 0) {
+				plist_t archive = NULL;
+				plist_from_bin((const char *)file_blob, (uint32_t)file_blob_len, &archive);
+				if (archive) {
+					printf("  NSKeyedArchiver:\n");
+					mb2_print_indent(4);
+					mb2_dump_plist_node(archive, 4);
+					printf("\n");
+					plist_free(archive);
+				} else {
+					printf("  NSKeyedArchiver: (invalid plist)\n");
+				}
+			} else {
+				printf("  NSKeyedArchiver: (empty)\n");
+			}
+		} else {
+			printf("  Manifest.db: (no entry)\n");
+		}
+		sqlite3_reset(stmt);
+		sqlite3_clear_bindings(stmt);
+	}
+
+	sqlite3_finalize(stmt);
+	sqlite3_close(db);
+	mb2_clear_last_batch();
+}
+
 static int errno_to_device_error(int errno_value)
 {
 	switch (errno_value) {
@@ -740,8 +1306,19 @@ static int errno_to_device_error(int errno_value)
 			return -6;
 		case EEXIST:
 			return -7;
+
+		case ENOTDIR:
+			return -8;
+		case EISDIR:
+			return -9;
+		case ELOOP:
+			return -10;
+		case EIO:
+			return -11;
+		case ENOSPC:
+			return -15;
 		default:
-			return -errno_value;
+			return -1;
 	}
 }
 
@@ -752,6 +1329,12 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	uint32_t bytes = 0;
 	char *localfile = string_build_path(backup_dir, path, NULL);
 	char buf[32768];
+
+	// Track the current file being processed
+	if (last_processed_file) {
+		free(last_processed_file);
+	}
+	last_processed_file = strdup(path);
 #ifdef WIN32
 	struct _stati64 fst;
 #else
@@ -770,6 +1353,9 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	off_t total;
 	off_t sent;
 #endif
+	int sha_enabled = show_file_digests ? 1 : 0;
+	SHA_CTX sha_ctx;
+	unsigned char sha_digest[SHA_DIGEST_LENGTH];
 
 	mobilebackup2_error_t err;
 
@@ -800,7 +1386,22 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	if (stat(localfile, &fst) < 0)
 #endif
 	{
-		if (errno != ENOENT)
+		if (errno == ENOENT) {
+			missing_total++;
+			if (!abort_on_missing_files) {
+				const char *file_id = strrchr(path, '/');
+				file_id = file_id ? file_id + 1 : path;
+				if (mb2_manifest_is_empty_placeholder(backup_dir, file_id)) {
+					missing_skipped++;
+					if (restore_debug_mode) {
+						PRINT_VERBOSE(1, "  [Missing] Skipping placeholder file: %s\n", path);
+					}
+					errcode = 0;
+					goto leave;
+				}
+			}
+			missing_failed++;
+		}
 		errcode = errno;
 		goto leave;
 	}
@@ -822,6 +1423,9 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	}
 
 	sent = 0;
+	if (sha_enabled) {
+		SHA1_Init(&sha_ctx);
+	}
 	do {
 		length = ((total-sent) < (long long)sizeof(buf)) ? (uint32_t)total-sent : (uint32_t)sizeof(buf);
 		/* send data size (file size + 1) */
@@ -843,6 +1447,9 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 			errcode = errno;
 			goto leave;
 		}
+		if (sha_enabled) {
+			SHA1_Update(&sha_ctx, buf, r);
+		}
 		err = mobilebackup2_send_raw(mobilebackup2, buf, r, &bytes);
 		if (err != MOBILEBACKUP2_E_SUCCESS) {
 			goto leave_proto_err;
@@ -856,6 +1463,15 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	fclose(f);
 	f = NULL;
 	errcode = 0;
+	if (sha_enabled) {
+		SHA1_Final(sha_digest, &sha_ctx);
+		char sha_hex[SHA_DIGEST_LENGTH * 2 + 1];
+		for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+			snprintf(sha_hex + (i * 2), 3, "%02x", sha_digest[i]);
+		}
+		sha_hex[SHA_DIGEST_LENGTH * 2] = '\0';
+		PRINT_VERBOSE(1, "  [Digest] %s %s\n", path, sha_hex);
+	}
 
 leave:
 	if (errcode == 0) {
@@ -871,6 +1487,9 @@ leave:
 		}
 		char *errdesc = strerror(errcode);
 		mb2_multi_status_add_file_error(*errplist, path, errno_to_device_error(errcode), errdesc);
+		if (restore_debug_mode) {
+			fprintf(stderr, "ERROR: Local file failure '%s': %s (%d)\n", path, errdesc, errcode);
+		}
 
 		length = strlen(errdesc);
 		nlen = htobe32(length+1);
@@ -905,6 +1524,7 @@ static void mb2_handle_send_files(mobilebackup2_client_t mobilebackup2, plist_t 
 	if (!message || (plist_get_node_type(message) != PLIST_ARRAY) || (plist_array_get_size(message) < 2) || !backup_dir) return;
 
 	plist_t files = plist_array_get_item(message, 1);
+	mb2_set_last_batch(files, backup_dir);
 	cnt = plist_array_get_size(files);
 
 	for (i = 0; i < cnt; i++) {
@@ -917,7 +1537,16 @@ static void mb2_handle_send_files(mobilebackup2_client_t mobilebackup2, plist_t 
 		if (!str)
 			continue;
 
+		// Debug output: show which file is being sent
+		if (restore_debug_mode) {
+			PRINT_VERBOSE(1, "  [%u/%u] Sending: %s\n", i + 1, cnt, str);
+		}
+
 		if (mb2_handle_send_file(mobilebackup2, backup_dir, str, &errplist) < 0) {
+			mb2_print_file_error(errplist, str);
+			if (restore_debug_mode) {
+				PRINT_VERBOSE(1, "  [ERROR] Failed to send file: %s\n", str);
+			}
 			free(str);
 			//printf("Error when sending file '%s' to device\n", str);
 			// TODO: perhaps we can continue, we've got a multi status response?!
@@ -935,6 +1564,9 @@ static void mb2_handle_send_files(mobilebackup2_client_t mobilebackup2, plist_t 
 		mobilebackup2_send_status_response(mobilebackup2, 0, NULL, emptydict);
 		plist_free(emptydict);
 	} else {
+		if (restore_debug_mode) {
+			mb2_print_plist_debug(errplist, "Local file errors (multi-status):");
+		}
 		mobilebackup2_send_status_response(mobilebackup2, -13, "Multi status", errplist);
 		plist_free(errplist);
 	}
@@ -1438,7 +2070,7 @@ static void print_usage(int argc, char **argv)
 
 #define DEVICE_VERSION(maj, min, patch) (((maj & 0xFF) << 16) | ((min & 0xFF) << 8) | (patch & 0xFF))
 
-int mainLOL(char *path, char *uuidi)
+int mainLOL(char *path, char *uuidi, char *backup_password, int restore_system_files)
 {
 	idevice_error_t ret = IDEVICE_E_UNKNOWN_ERROR;
 	lockdownd_error_t ldret = LOCKDOWN_E_UNKNOWN_ERROR;
@@ -1453,7 +2085,7 @@ int mainLOL(char *path, char *uuidi)
 	int result_code = -1;
 	char* backup_directory = NULL;
 	int interactive_mode = 0;
-	char* backup_password = NULL;
+	int password_allocated = 0;  /* Track if we allocated backup_password */
 	char* newpw = NULL;
 	struct stat st;
 	plist_t node_tmp = NULL;
@@ -1474,6 +2106,9 @@ int mainLOL(char *path, char *uuidi)
     backup_directory = path;
     cmd = CMD_RESTORE;
     cmd_flags |= CMD_FLAG_RESTORE_SETTINGS;
+    if (restore_system_files) {
+        cmd_flags |= CMD_FLAG_RESTORE_SYSTEM_FILES;
+    }
 
 	/* verify options */
 	if (cmd == -1) {
@@ -1589,11 +2224,13 @@ int mainLOL(char *path, char *uuidi)
 	if ((ldret == LOCKDOWN_E_SUCCESS) && service && service->port) {
 		np_client_new(device, service, &np);
 		np_set_notify_callback(np, notify_cb, NULL);
-		const char *noties[5] = {
+		const char *noties[7] = {
 			NP_SYNC_CANCEL_REQUEST,
 			NP_SYNC_SUSPEND_REQUEST,
 			NP_SYNC_RESUME_REQUEST,
 			NP_BACKUP_DOMAIN_CHANGED,
+			"com.apple.LocalAuthentication.ui.presented",
+			"com.apple.LocalAuthentication.ui.dismissed",
 			NULL
 		};
 		np_observe_notifications(np, noties);
@@ -1712,6 +2349,8 @@ checkpoint:
 				break;
 			}
 
+			mb2_missing_reset();
+
 			PRINT_VERBOSE(1, "Starting Restore...\n");
 
 			opts = plist_new_dict();
@@ -1726,6 +2365,18 @@ checkpoint:
 			if (backup_password != NULL) {
 				plist_dict_set_item(opts, "Password", plist_new_string(backup_password));
 			}
+
+			/* Verbose: print restore request arguments */
+			PRINT_VERBOSE(1, "Restore request arguments:\n");
+			PRINT_VERBOSE(1, "  Request type:            Restore\n");
+			PRINT_VERBOSE(1, "  Target UDID:             %s\n", udid);
+			PRINT_VERBOSE(1, "  Source UDID:             %s\n", source_udid);
+			PRINT_VERBOSE(1, "  RestoreSystemFiles:      %s\n", (cmd_flags & CMD_FLAG_RESTORE_SYSTEM_FILES) ? "true" : "false");
+			PRINT_VERBOSE(1, "  RestoreShouldReboot:     %s\n", (cmd_flags & CMD_FLAG_RESTORE_NO_REBOOT) ? "false" : "true (default)");
+			PRINT_VERBOSE(1, "  RestoreDontCopyBackup:   %s\n", (cmd_flags & CMD_FLAG_RESTORE_COPY_BACKUP) ? "false" : "true");
+			PRINT_VERBOSE(1, "  RestorePreserveSettings: %s\n", (cmd_flags & CMD_FLAG_RESTORE_SETTINGS) ? "false" : "true");
+			PRINT_VERBOSE(1, "  RemoveItemsNotRestored:  %s\n", (cmd_flags & CMD_FLAG_RESTORE_REMOVE_ITEMS) ? "true" : "false");
+			PRINT_VERBOSE(1, "  Password:                %s\n", (backup_password != NULL) ? "<set>" : "<not set>");
 
 			if (cmd_flags & CMD_FLAG_RESTORE_SKIP_APPS) {
 			} else {
@@ -1807,6 +2458,7 @@ checkpoint:
 				if (willEncrypt) {
 					if (!backup_password) {
 						backup_password = ask_for_password("Enter current backup password", 0);
+						password_allocated = 1;
 					}
 				} else {
 					printf("ERROR: Backup encryption is not enabled. Aborting.\n");
@@ -1820,6 +2472,7 @@ checkpoint:
 				if (willEncrypt) {
 					if (!backup_password) {
 						backup_password = ask_for_password("Enter old backup password", 0);
+						password_allocated = 1;
 						newpw = ask_for_password("Enter new backup password", 1);
 					}
 				} else {
@@ -2101,13 +2754,19 @@ checkpoint:
 					if (nn && (plist_get_node_type(nn) == PLIST_STRING)) {
 						plist_get_string_val(nn, &str);
 					}
-					if (error_code != 0) {
-						if (str) {
-							printf("ErrorCode %d: %s\n", error_code, str);
-						} else {
-							printf("ErrorCode %d: (Unknown)\n", error_code);
-						}
-					}
+			if (error_code != 0) {
+				if (str) {
+					printf("ErrorCode %d: %s\n", error_code, str);
+				} else {
+					printf("ErrorCode %d: (Unknown)\n", error_code);
+				}
+				if (error_code == 205) {
+					mb2_dump_manifest_db_batch();
+				}
+				if (restore_debug_mode) {
+					mb2_print_plist_debug(node_tmp, "Device error details:");
+				}
+			}
 					if (str) {
 						free(str);
 					}
@@ -2126,9 +2785,12 @@ checkpoint:
 				if ((overall_progress > 0) && !progress_finished) {
 					if (overall_progress >= 100.0f) {
 						progress_finished = 1;
+						print_progress_real(overall_progress, 0);
+						PRINT_VERBOSE(1, " Finished\n");
+					} else {
+						print_progress_real(overall_progress, 0);
+						fflush(stdout);
 					}
-					print_progress_real(overall_progress, 0);
-					PRINT_VERBOSE(1, " Finished\n");
 				}
 
 files_out:
@@ -2216,16 +2878,21 @@ files_out:
 					if ((cmd_flags & CMD_FLAG_RESTORE_NO_REBOOT) == 0)
 						PRINT_VERBOSE(1, "The device should reboot now.\n");
 					PRINT_VERBOSE(1, "Restore Successful.\n");
-				} else {
-					afc_remove_path(afc, "/iTunesRestore/RestoreApplications.plist");
-					afc_remove_path(afc, "/iTunesRestore");
+} else {
+						afc_remove_path(afc, "/iTunesRestore/RestoreApplications.plist");
+						afc_remove_path(afc, "/iTunesRestore");
 					if (quit_flag) {
 						PRINT_VERBOSE(1, "Restore Aborted.\n");
 					} else {
 						PRINT_VERBOSE(1, "Restore Failed (Error Code %d).\n", -result_code);
+						if (last_processed_file) {
+							PRINT_VERBOSE(1, "Last file processed: %s\n", last_processed_file);
+						}
 					}
 				}
-				break;
+				mb2_print_missing_summary();
+				mb2_missing_manifest_close();
+			break;
 				case CMD_INFO:
 				case CMD_LIST:
 				case CMD_LEAVE:
@@ -2276,7 +2943,7 @@ files_out:
 	idevice_free(device);
 	device = NULL;
 
-	if (backup_password) {
+	if (backup_password && password_allocated) {
 		free(backup_password);
 	}
 
@@ -2287,6 +2954,11 @@ files_out:
 		source_udid = NULL;
 	}
 
+	// Cleanup the last processed file tracking
+	if (last_processed_file) {
+		free(last_processed_file);
+		last_processed_file = NULL;
+	}
+
 	return result_code;
 }
-
