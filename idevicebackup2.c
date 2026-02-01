@@ -2070,7 +2070,7 @@ static void print_usage(int argc, char **argv)
 
 #define DEVICE_VERSION(maj, min, patch) (((maj & 0xFF) << 16) | ((min & 0xFF) << 8) | (patch & 0xFF))
 
-int mainLOL(char *path, char *uuidi, char *backup_password)
+int mainLOL(char *path, char *uuidi, char *backup_password, int restore_system_files)
 {
 	idevice_error_t ret = IDEVICE_E_UNKNOWN_ERROR;
 	lockdownd_error_t ldret = LOCKDOWN_E_UNKNOWN_ERROR;
@@ -2106,6 +2106,9 @@ int mainLOL(char *path, char *uuidi, char *backup_password)
     backup_directory = path;
     cmd = CMD_RESTORE;
     cmd_flags |= CMD_FLAG_RESTORE_SETTINGS;
+    if (restore_system_files) {
+        cmd_flags |= CMD_FLAG_RESTORE_SYSTEM_FILES;
+    }
 
 	/* verify options */
 	if (cmd == -1) {

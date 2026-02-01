@@ -30,6 +30,7 @@ static struct option long_options[] = {
     {"show-file-digests", no_argument, 0, 1003},
     {"show-digest-mismatches", no_argument, 0, 1004},
     {"abort-on-missing-files", no_argument, 0, 1005},
+    {"restore-system-files", no_argument, 0, 1006},
     {"dry-run",       no_argument,       0, 'n'},
     {"debug",         no_argument,       0, 'd'},
     {"help",          no_argument,       0, 'h'},
@@ -51,6 +52,7 @@ static void print_usage(const char *progname) {
     printf("      --show-file-digests  Log SHA1 for each sent file\n");
     printf("      --show-digest-mismatches  Log each Manifest.db digest mismatch\n");
     printf("      --abort-on-missing-files  Abort restore if any backup file is missing\n");
+    printf("      --restore-system-files   Enable restoration of system files (required for ConfigurationProfiles)\n");
     printf("  -n, --dry-run              Preview changes without restoring\n");
     printf("  -d, --debug                Enable debug output (show each file during restore)\n");
     printf("  -h, --help                 Show this help message\n");
@@ -128,6 +130,7 @@ int main(int argc, char *argv[]) {
     int show_file_digests_flag = 0;
     int show_digest_mismatches = 0;
     int abort_on_missing_files_flag = 0;
+    int restore_system_files = 0;
     int dry_run = 0;
     int c;
 
@@ -163,6 +166,9 @@ int main(int argc, char *argv[]) {
                 break;
             case 1005:
                 abort_on_missing_files_flag = 1;
+                break;
+            case 1006:
+                restore_system_files = 1;
                 break;
             case 'n':
                 dry_run = 1;
@@ -410,7 +416,7 @@ int main(int argc, char *argv[]) {
         printf("Please keep device connected and unlocked.\n\n");
         
         // Execute restore - use temp_path which has MDMB symlink/copy pointing to workspace
-        result = mainLOL(temp_path, uniqueDeviceID, backup_password);
+        result = mainLOL(temp_path, uniqueDeviceID, backup_password, restore_system_files);
 
         // Cleanup
         if (result == 0) {
@@ -484,7 +490,7 @@ int main(int argc, char *argv[]) {
     printf("Please keep device connected and unlocked.\n\n");
     
     // Execute restore
-    result = mainLOL(temp_path, uniqueDeviceID, backup_password);
+    result = mainLOL(temp_path, uniqueDeviceID, backup_password, restore_system_files);
 
     // Cleanup
     if (result == 0) {
