@@ -344,7 +344,7 @@ python3 tools/decrypt_backup.py ~/Library/Application\ Support/MobileSync/Backup
 # Alternative: Modify backup in-place (saves disk space, modifies original)
 ./mdm_patch --backup-source ~/DecryptedBackup --in-place
 
-# Alternative: Restore with system files (required for ConfigurationProfiles)
+# Alternative: Restore with system files (maybe required for ConfigurationProfiles)
 ./mdm_patch --backup-source ~/DecryptedBackup --restore-system-files -p "password"
 
 # Alternative: Preview changes without restoring (dry-run)
