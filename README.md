@@ -37,6 +37,14 @@ MDM Patcher is a command-line tool that helps remove Mobile Device Management (M
 
 ---
 
+## About This Fork
+
+This is a fork of the original **[MDMPatcher-Linux](https://github.com/Gudui/MDMPatcher-Linux)** by Gudui.
+
+**Key Enhancement**: This fork adds the ability to restore from existing user backups while patching for MDM removal. The original tool only worked with a minimal built-in template backup. This enhancement allows users to preserve their apps, settings, photos, messages, and other personal data during the MDM removal process.
+
+---
+
 ## Requirements
 
 ### Hardware
@@ -326,18 +334,49 @@ This mode uses your own decrypted backup, preserving your data while removing MD
 python3 tools/decrypt_backup.py ~/Library/Application\ Support/MobileSync/Backup/DEVICE_UDID \
     -o ~/DecryptedBackup
 
-# Step 2: Run the patcher with your backup
+# Step 2: Run the patcher with your backup (basic usage)
 ./mdm_patch --backup-source ~/DecryptedBackup
+
+# Step 3: Provide backup password (required even for decrypted backups)
+# The password is used to decrypt the BackupKeyBag for integrity verification
+./mdm_patch --backup-source ~/DecryptedBackup --password "your_backup_password"
 
 # Alternative: Modify backup in-place (saves disk space, modifies original)
 ./mdm_patch --backup-source ~/DecryptedBackup --in-place
+
+# Alternative: Restore with system files (required for ConfigurationProfiles)
+./mdm_patch --backup-source ~/DecryptedBackup --restore-system-files -p "password"
 
 # Alternative: Preview changes without restoring (dry-run)
 ./mdm_patch --backup-source ~/DecryptedBackup --dry-run
 
 # Alternative: Specify target device UDID explicitly
-./mdm_patch --backup-source ~/DecryptedBackup --target-udid 00008150-XXXX
+./mdm_patch --backup-source ~/DecryptedBackup --target-udid 00008150-XXXX -p "password"
+
+# Advanced: Full example with all recommended flags
+./mdm_patch --backup-source ~/DecryptedBackup \
+    --password "your_backup_password" \
+    --restore-system-files \
+    --in-place \
+    --debug
 ```
+
+**Common User Backup Mode Scenarios**:
+
+1. **Restoring from a fresh backup** (most common):
+   ```bash
+   ./mdm_patch --backup-source ~/DecryptedBackup --password "your_password"
+   ```
+
+2. **Restoring with system files** (required for ConfigurationProfiles):
+   ```bash
+   ./mdm_patch --backup-source ~/DecryptedBackup --password "your_password" --restore-system-files
+   ```
+
+3. **Testing without restoring** (dry-run to verify backup integrity):
+   ```bash
+   ./mdm_patch --backup-source ~/DecryptedBackup --dry-run
+   ```
 
 **Command-line Options:**
 
@@ -345,15 +384,27 @@ python3 tools/decrypt_backup.py ~/Library/Application\ Support/MobileSync/Backup
 |--------|-------------|
 | `-b, --backup-source PATH` | Use existing decrypted backup instead of built-in template |
 | `-u, --target-udid UDID` | Target device UDID (default: auto-detect connected device) |
+| `-p, --password PASSWORD` | Backup password for BackupKeyBag decryption during restore (see note below) |
 | `-i, --in-place` | Modify backup directly instead of copying (saves disk space) |
-| `--restore-system-files` | Enable restoration of system files (required for ConfigurationProfiles) |
+| `--overwrite-existing-profiles` | Replace existing ConfigurationProfiles in backup with clean versions |
+| `--ignore-manifest-sizes` | Skip Manifest.db size fix-ups during restore |
+| `--show-size-mismatches` | Log each Manifest.db size mismatch detected |
 | `--show-file-digests` | Log SHA1 digest for each file sent during restore |
 | `--show-digest-mismatches` | Log each Manifest.db digest mismatch detected |
 | `--abort-on-missing-files` | Abort restore if any backup file is missing |
+| `--restore-system-files` | Enable restoration of system files (required for ConfigurationProfiles) |
 | `-n, --dry-run` | Preview changes without performing restore |
 | `-d, --debug` | Enable debug output (shows each file during restore) |
 | `-h, --help` | Show help message |
 | `-V, --version` | Show version information |
+
+> **Note on Backup Password (`-p`)**:  
+> Even if you've already decrypted your backup files, the backup password is still required during restore. iOS uses the password to decrypt the `BackupKeyBag` metadata stored in `Manifest.plist`, which is essential for:
+> - Verifying file integrity using SHA-1 digests
+> - Properly handling encrypted file metadata
+> - Ensuring the restore process completes successfully on iOS 15+
+>
+> The `BackupKeyBag` is preserved in the decrypted backup by `tools/decrypt_backup.py` for this exact reason.
 
 ### Expected Output
 
@@ -525,7 +576,8 @@ mdmpatcher/
 
 ## Credits & Acknowledgments
 
-- Original **MDMPatcher Enhanced** by [fled-dev](https://github.com/fled-dev)
+- **[MDMPatcher-Linux](https://github.com/Gudui/MDMPatcher-Linux)** by Gudui - Original Linux port (forked)
+- **[MDMPatcher Enhanced](https://github.com/fled-dev/MDMPatcher-Enhanced)** by fled-dev - macOS GUI application (base implementation)
 - **libimobiledevice** team for iOS communication libraries
 - **RNCryptor** specification for the encryption format
 - Community contributors for testing and feedback
