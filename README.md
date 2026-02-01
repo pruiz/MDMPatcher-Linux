@@ -216,6 +216,84 @@ The decrypted backup will be created at the output path, preserving the iOS back
 
 ---
 
+## Utility Scripts
+
+The `tools/` directory contains additional utility scripts for working with iOS backups and debugging:
+
+### decrypt_backup.py
+Decrypts iOS encrypted backups while preserving restore-compatible structure.
+
+```bash
+python3 tools/decrypt_backup.py /path/to/encrypted_backup -o /path/to/decrypted_output
+```
+
+Features:
+- Decrypts all backup files while preserving SHA-1 filename structure
+- Validates backup after decryption
+- Can fix encryption metadata in existing decrypted backups
+- Supports verbose output and dry-run validation
+
+### setup_venv.sh
+Creates a Python virtual environment and installs required dependencies.
+
+```bash
+cd tools
+./setup_venv.sh
+source .venv/bin/activate
+```
+
+### check-manifestdb.py
+Analyzes file blob metadata in Manifest.db, reporting field statistics and encryption key types.
+
+```bash
+python3 tools/check-manifestdb.py /path/to/Manifest.db
+```
+
+### dump-manifestdb.py
+Analyzes Manifest.db to detect hard links, symbolic links, and report file metadata fields.
+
+```bash
+python3 tools/dump-manifestdb.py /path/to/Manifest.db
+```
+
+Features:
+- Detects hard links (files sharing same InodeNumber)
+- Detects symbolic links (files with Target field or symlink mode)
+- Reports all fields present in file blobs
+- ConfigurationProfiles link analysis
+
+### verify-manifest.py
+Validates backup integrity by comparing Manifest.db entries with actual files on disk.
+
+```bash
+python3 tools/verify-manifest.py /path/to/backup/directory
+```
+
+Exit codes:
+- 0: All referenced files exist
+- 1: Manifest.db not found
+- 2: Missing files detected
+
+### dump-enckeys.py
+Extracts and displays encryption key information from sample files in Manifest.db.
+
+```bash
+python3 tools/dump-enckeys.py --db /path/to/Manifest.db
+```
+
+Shows EncryptionKey structure from first 5 files. Useful for understanding metadata format.
+
+### dump-enckeys2.py
+Lists all encrypted files in backup with encryption key previews.
+
+```bash
+python3 tools/dump-enckeys2.py /path/to/Manifest.db
+```
+
+Displays file paths, file IDs, key lengths, and key previews for all encrypted files.
+
+---
+
 
 ## Usage
 
@@ -428,11 +506,16 @@ mdmpatcher/
 ├── extension1.pdf              # Encrypted Info.plist template
 ├── extension2.pdf              # Encrypted Manifest.plist template
 ├── libiMobileeDevice.dylib     # Encrypted backup structure
-└── tools/
-    ├── decrypt_backup.py       # Backup decryption script (Python)
-    ├── requirements.txt        # Python dependencies
-    └── setup_venv.sh           # Virtual environment setup script
-```
+ └── tools/
+     ├── decrypt_backup.py       # Backup decryption script (Python)
+     ├── requirements.txt        # Python dependencies
+     ├── setup_venv.sh           # Virtual environment setup script
+     ├── check-manifestdb.py  # Analyze file blob metadata
+     ├── dump-manifestdb.py    # Detect hard/symbolic links
+     ├── verify-manifest.py    # Validate backup integrity
+     ├── dump-enckeys.py      # Extract encryption key samples
+     └── dump-enckeys2.py     # List all encrypted files
+ ```
 
 
 ## Credits & Acknowledgments
